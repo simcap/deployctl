@@ -2,11 +2,13 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -14,27 +16,119 @@ import (
 )
 
 var (
-	targetFlag, userFlag, proxyFlag, keyFlag string
+	cliHome        = filepath.Join(os.Getenv("HOME"), ".deployd")
+	configFilepath = filepath.Join(cliHome, "config.json")
 
-	serviceNameFlag string
+	targetFlag, userFlag, proxyFlag, keyFlag string
+	envFlag, serviceNameFlag, rootDirFlag    string
+	logLinesCount                            int
+	tailOption                               bool
+
+	logsCmd = flag.NewFlagSet("logs", flag.ExitOnError)
 )
 
 func init() {
+	flag.StringVar(&envFlag, "env", "", fmt.Sprintf("Specify an env defined in the config file %s", configFilepath))
 	flag.StringVar(&targetFlag, "h", "", "ssh hostname")
 	flag.StringVar(&proxyFlag, "proxy", "", "ssh proxy (i.e. jump server, bastion, etc.)")
 	flag.StringVar(&userFlag, "u", "", "ssh user")
 	flag.StringVar(&serviceNameFlag, "s", "", "Name of the systemd service")
+	flag.StringVar(&rootDirFlag, "r", "", "Full path of the root directory on the remote (contains all services dirs)")
+
+	logsCmd.IntVar(&logLinesCount, "n", 10, "Show the last n journalctl logs line")
+	logsCmd.BoolVar(&tailOption, "f", false, "Tail and follow the logs")
 }
 
 func main() {
-	flag.Parse()
 	log.SetFlags(0)
+	flag.Parse()
+
+	if serviceNameFlag == "" {
+		log.Fatal("missing -s flag name of service")
+	}
+
+	conf, err := loadConfig()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if serviceNameFlag == "" {
+		log.Fatal("missing -s flag name of service")
+	}
+
+	if len(envFlag) > 0 {
+		ok, env := conf.getEnv(envFlag)
+		if !ok {
+			log.Fatalf("env %s is not define in config file %s", envFlag, configFilepath)
+		}
+		mergeFlagAndConfigEnv(env)
+	}
 
 	client := connect()
 	defer client.Close()
 
-	run(client, fmt.Sprintf("systemctl status %s", serviceNameFlag))
-	run(client, fmt.Sprintf("sudo journalctl -u %s", serviceNameFlag))
+	switch flag.Arg(0) {
+	case "logs":
+		logsCmd.Parse(flag.Args()[1:])
+		if tailOption {
+			run(client, fmt.Sprintf("sudo journalctl -fu %s", serviceNameFlag))
+			return
+		}
+		run(client, fmt.Sprintf("sudo journalctl -n %d -u %s", logLinesCount, serviceNameFlag))
+	default:
+		run(client, fmt.Sprintf("systemctl status %s", serviceNameFlag))
+	}
+}
+
+type Config struct {
+	Envs map[string]*Env
+}
+
+func (c Config) getEnv(name string) (bool, *Env) {
+	for n, env := range c.Envs {
+		if n == name {
+			return true, env
+		}
+	}
+	return false, nil
+}
+
+type Env struct {
+	Host    string
+	Proxy   string
+	RootDir string
+	User    string
+}
+
+func loadConfig() (Config, error) {
+	var conf Config
+	if _, err := os.Stat(configFilepath); os.IsNotExist(err) {
+		return conf, nil
+	}
+
+	f, err := os.Open(configFilepath)
+	if err != nil {
+		return conf, nil
+	}
+	if err := json.NewDecoder(f).Decode(&conf); err != nil {
+		return conf, fmt.Errorf("cannot unmarshal json config file at %s: %s", configFilepath, err)
+	}
+	return conf, nil
+}
+
+func mergeFlagAndConfigEnv(env *Env) {
+	if len(env.Host) > 0 {
+		targetFlag = env.Host
+	}
+	if len(env.Proxy) > 0 {
+		proxyFlag = env.Proxy
+	}
+	if len(env.User) > 0 {
+		userFlag = env.User
+	}
+	if len(env.RootDir) > 0 {
+		rootDirFlag = env.RootDir
+	}
 }
 
 func run(client *ssh.Client, cmd string) {
