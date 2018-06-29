@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"time"
 
@@ -19,12 +21,13 @@ var (
 	cliHome        = filepath.Join(os.Getenv("HOME"), ".deployd")
 	configFilepath = filepath.Join(cliHome, "config.json")
 
-	targetFlag, userFlag, proxyFlag, keyFlag string
-	envFlag, serviceNameFlag, rootDirFlag    string
-	logLinesCount                            int
-	tailOption                               bool
+	targetFlag, userFlag, proxyFlag, keyFlag           string
+	envFlag, serviceNameFlag, rootDirFlag, binFileFlag string
+	logLinesCount                                      int
+	tailOption                                         bool
 
-	logsCmd = flag.NewFlagSet("logs", flag.ExitOnError)
+	logsCmd   = flag.NewFlagSet("logs", flag.ExitOnError)
+	deployCmd = flag.NewFlagSet("deploy", flag.ExitOnError)
 )
 
 func init() {
@@ -34,6 +37,8 @@ func init() {
 	flag.StringVar(&userFlag, "u", "", "ssh user")
 	flag.StringVar(&serviceNameFlag, "s", "", "Name of the systemd service")
 	flag.StringVar(&rootDirFlag, "r", "", "Full path of the root directory on the remote (contains all services dirs)")
+
+	deployCmd.StringVar(&binFileFlag, "bin", "", "Filepath of the service binary file")
 
 	logsCmd.IntVar(&logLinesCount, "n", 10, "Show the last n journalctl logs line")
 	logsCmd.BoolVar(&tailOption, "f", false, "Tail and follow the logs")
@@ -68,6 +73,15 @@ func main() {
 	defer client.Close()
 
 	switch flag.Arg(0) {
+	case "deploy":
+		deployCmd.Parse(flag.Args()[1:])
+		session, err := client.NewSession()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := copyFile(session, binFileFlag); err != nil {
+			log.Fatal(err)
+		}
 	case "logs":
 		logsCmd.Parse(flag.Args()[1:])
 		if tailOption {
@@ -129,6 +143,39 @@ func mergeFlagAndConfigEnv(env *Env) {
 	if len(env.RootDir) > 0 {
 		rootDirFlag = env.RootDir
 	}
+}
+
+func copyFile(session *ssh.Session, filepath string) error {
+	defer session.Close()
+
+	f, err := os.Open(filepath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+
+	w, err := session.StdinPipe()
+	if err != nil {
+		return err
+	}
+	defer w.Close()
+
+	if err := session.Start("scp -t /tmp"); err != nil {
+		w.Close()
+		return err
+	}
+
+	fmt.Fprintf(w, "C%#o %d %s\n", info.Mode().Perm(), info.Size(), path.Base(filepath))
+	io.Copy(w, f)
+	fmt.Fprint(w, "\x00")
+	w.Close()
+
+	return session.Wait()
 }
 
 func run(client *ssh.Client, cmd string) {
