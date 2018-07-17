@@ -15,6 +15,8 @@ import (
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
+	"os/exec"
+	"errors"
 )
 
 var (
@@ -28,6 +30,7 @@ var (
 
 	logsCmd   = flag.NewFlagSet("logs", flag.ExitOnError)
 	deployCmd = flag.NewFlagSet("deploy", flag.ExitOnError)
+	buildCmd = flag.NewFlagSet("build", flag.ExitOnError)
 )
 
 func init() {
@@ -69,12 +72,27 @@ func main() {
 		mergeFlagAndConfigEnv(env)
 	}
 
+	switch  flag.Arg(0) {
+	case "build":
+		if _, err := buildBinary(); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
 	client := connect()
 	defer client.Close()
 
-	switch flag.Arg(0) {
+	switch  flag.Arg(0) {
 	case "deploy":
 		deployCmd.Parse(flag.Args()[1:])
+		if binFileFlag == "" {
+			var err error
+			binFileFlag, err = buildBinary()
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
 		session, err := client.NewSession()
 		if err != nil {
 			log.Fatal(err)
@@ -112,6 +130,36 @@ type Env struct {
 	Proxy   string
 	RootDir string
 	User    string
+}
+
+func buildBinary() (string, error) {
+	if _, err := exec.LookPath("go"); err != nil {
+		return "", errors.New("cannot build binary as 'go' command not found")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		return "", errors.New("missing 'git' command to get HEAD sha")
+	}
+
+	goVersion, err := exec.Command("go", "version").Output()
+	if err != nil {
+		return "", err
+	}
+	goVersion = bytes.TrimSpace(goVersion)
+
+
+	sha, err := exec.Command("git", "rev-parse", "--short", "HEAD").Output()
+	if err != nil {
+		return "", err
+	}
+	sha = bytes.TrimSpace(sha)
+
+	goos := "GOOS=linux"
+	binName := fmt.Sprintf("%s-%s", serviceNameFlag, sha)
+	buildCmd := exec.Command("go", "build", "-o", binName)
+	buildCmd.Env = append(os.Environ(), goos)
+
+	log.Printf("executing %s with %s for %s", buildCmd.Args, goos, goVersion)
+	return binName, buildCmd.Run()
 }
 
 func loadConfig() (Config, error) {
