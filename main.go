@@ -13,14 +13,15 @@ import (
 	"path/filepath"
 	"time"
 
+	"errors"
+	"os/exec"
+
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
-	"os/exec"
-	"errors"
 )
 
 var (
-	cliHome        = filepath.Join(os.Getenv("HOME"), ".deployd")
+	cliHome        = filepath.Join(os.Getenv("HOME"), ".deployctl")
 	configFilepath = filepath.Join(cliHome, "config.json")
 
 	targetFlag, userFlag, proxyFlag, keyFlag           string
@@ -30,7 +31,7 @@ var (
 
 	logsCmd   = flag.NewFlagSet("logs", flag.ExitOnError)
 	deployCmd = flag.NewFlagSet("deploy", flag.ExitOnError)
-	buildCmd = flag.NewFlagSet("build", flag.ExitOnError)
+	buildCmd  = flag.NewFlagSet("build", flag.ExitOnError)
 )
 
 func init() {
@@ -72,7 +73,7 @@ func main() {
 		mergeFlagAndConfigEnv(env)
 	}
 
-	switch  flag.Arg(0) {
+	switch flag.Arg(0) {
 	case "build":
 		if _, err := buildBinary(); err != nil {
 			log.Fatal(err)
@@ -83,7 +84,7 @@ func main() {
 	client := connect()
 	defer client.Close()
 
-	switch  flag.Arg(0) {
+	switch flag.Arg(0) {
 	case "deploy":
 		deployCmd.Parse(flag.Args()[1:])
 		if binFileFlag == "" {
@@ -145,7 +146,6 @@ func buildBinary() (string, error) {
 		return "", err
 	}
 	goVersion = bytes.TrimSpace(goVersion)
-
 
 	sha, err := exec.Command("git", "rev-parse", "--short", "HEAD").Output()
 	if err != nil {
@@ -219,7 +219,21 @@ func copyFile(session *ssh.Session, filepath string) error {
 	}
 
 	fmt.Fprintf(w, "C%#o %d %s\n", info.Mode().Perm(), info.Size(), path.Base(filepath))
-	io.Copy(w, f)
+
+	reader := io.TeeReader(f, w)
+	buff := make([]byte, 1024)
+	var total int
+	for {
+		i, err := reader.Read(buff)
+		if err == io.EOF && i == 0 {
+			break
+		}
+		total = total + i
+		percent := int64(100*total) / info.Size()
+		fmt.Printf("Copying to remote %d%%\r", percent)
+	}
+
+	fmt.Println("\nDone.")
 	fmt.Fprint(w, "\x00")
 	w.Close()
 
@@ -261,28 +275,36 @@ func connect() *ssh.Client {
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 
-	proxyHostPort := fmt.Sprintf("%s:22", proxyFlag)
-	log.Printf("dialing %s@%s", userFlag, proxyHostPort)
-	conn, err := ssh.Dial("tcp", proxyHostPort, conf)
-	if err != nil {
-		log.Fatal(err)
+	if len(proxyFlag) > 0 {
+		proxyHostPort := fmt.Sprintf("%s:22", proxyFlag)
+		log.Printf("dialing %s@%s", userFlag, proxyHostPort)
+		conn, err := ssh.Dial("tcp", proxyHostPort, conf)
+		if err != nil {
+			log.Fatal(err)
+		}
+		targetHostPort := fmt.Sprintf("%s:22", targetFlag)
+		fullConn, err := conn.Dial("tcp", targetHostPort)
+		if err != nil {
+			log.Fatalf("cannot dial from %s to %s: %s", proxyFlag, targetFlag, err)
+		}
+		log.Printf("successful tcp connection from %s to %s", proxyFlag, targetFlag)
+		finalConn, chans, reqs, err := ssh.NewClientConn(fullConn, targetHostPort, conf)
+		if err != nil {
+			fullConn.Close()
+			log.Fatalf("cannot proxy with user %s (err: %s)", userFlag, err)
+		}
+		log.Printf("proxied successfully with user %s", userFlag)
+
+		return ssh.NewClient(finalConn, chans, reqs)
 	}
 
 	targetHostPort := fmt.Sprintf("%s:22", targetFlag)
-	fullConn, err := conn.Dial("tcp", targetHostPort)
+	client, err := ssh.Dial("tcp", targetHostPort, conf)
 	if err != nil {
-		log.Fatalf("cannot dial from %s to %s", proxyFlag, targetFlag)
+		log.Fatalf("cannot dial to %s: %s", targetFlag, err)
 	}
-	log.Printf("successful tcp connection from %s to %s", proxyFlag, targetFlag)
-
-	finalConn, chans, reqs, err := ssh.NewClientConn(fullConn, targetHostPort, conf)
-	if err != nil {
-		fullConn.Close()
-		log.Fatalf("cannot proxy with user %s (err: %s)", userFlag, err)
-	}
-	log.Printf("proxied successfully with user %s", userFlag)
-
-	return ssh.NewClient(finalConn, chans, reqs)
+	log.Printf("successful tcp connection to %s", targetFlag)
+	return client
 }
 
 func agentAuth() (ssh.AuthMethod, error) {
